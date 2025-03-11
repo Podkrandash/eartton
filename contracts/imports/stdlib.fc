@@ -1,0 +1,23 @@
+;; Standard library for FunC
+;; Базовые функции для работы с TON
+
+;; Получение текущего времени
+int now() asm "NOW";
+
+;; Получение текущего воркчейна
+int workchain() asm "0 PUSHINT";
+
+;; Получение адреса текущего контракта
+slice my_address() asm "MYADDR";
+
+;; Сравнение двух слайсов
+int equal_slices(slice a, slice b) asm "SDEQ";
+
+;; Вызов метода другого контракта
+;; Примечание: в реальном TON это не работает так напрямую, 
+;; это упрощение для демонстрации
+(tuple) contract_call(slice address, slice method, tuple params) impure {
+    ;; В реальности здесь должен быть код для асинхронного вызова
+    ;; через сообщения, но для примера мы упрощаем
+    return null();
+} 

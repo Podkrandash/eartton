@@ -1,0 +1,64 @@
+;; Parameters for Eartton
+;; Параметры для стандарта Eartton
+
+;; Константы для стейкинга
+const int MIN_STAKING_DURATION = 86400; ;; Минимальная продолжительность стейкинга (1 день в секундах)
+const int MAX_STAKING_DURATION = 31536000; ;; Максимальная продолжительность стейкинга (1 год в секундах)
+const int DEFAULT_STAKING_APR = 1000; ;; Базовый APR для стейкинга (10% в базисных пунктах)
+
+;; Константы для фарминга
+const int DEFAULT_REWARD_RATE = 100; ;; Базовая ставка наград (токенов в секунду * 10^-9)
+const int MIN_FARMING_DEPOSIT = 1000000000; ;; Минимальный депозит для фарминга (1 токен)
+
+;; Константы для сжигания
+const int DEFAULT_BURN_RATE = 100; ;; Базовая ставка сжигания (1% в базисных пунктах)
+const int MAX_BURN_RATE = 5000; ;; Максимальная ставка сжигания (50% в базисных пунктах)
+
+;; Другие константы
+const int MAX_BLACKLIST_SIZE = 1000; ;; Максимальный размер черного списка 
+
+;; Базовые параметры
+const int DECIMALS = 9;
+const int MIN_TRANSFER = 1000; ;; 0.000001 TON
+const int GAS_CONSUMPTION = 10000000; ;; 0.01 TON
+
+;; Параметры управления
+const int VOTING_PERIOD = 7 * 24 * 3600; ;; 7 дней
+const int MIN_QUORUM = 100; ;; Минимальное количество голосов
+const int SUPER_MAJORITY = 66; ;; 66% для принятия решения
+
+;; Параметры стейкинга
+const int MIN_STAKE_PERIOD = 30 * 24 * 3600; ;; 30 дней
+const int MAX_STAKE_PERIOD = 365 * 24 * 3600; ;; 1 год
+const int MIN_STAKE_AMOUNT = 1000000000; ;; 1 токен
+const int MAX_APR_BOOST = 100; ;; +100% к базовому APR
+const int APR_BOOST_PERIOD = 30 * 24 * 3600; ;; +0.5% каждые 30 дней
+
+;; Параметры AMM
+const int MIN_LIQUIDITY = 1000000; ;; Минимальная ликвидность
+const int DEFAULT_FEE = 30; ;; 0.3%
+const int MIN_FEE = 1; ;; 0.01%
+const int MAX_FEE = 100; ;; 1%
+const int PRICE_IMPACT_LIMIT = 1000; ;; 10% максимальное влияние на цену
+
+;; Параметры динамических механизмов
+const int REBALANCE_PERIOD = 24 * 3600; ;; 24 часа
+const int MIN_BURN_RATE = 10; ;; 0.1%
+const int MAX_BURN_RATE = 1000; ;; 10%
+const int MIN_VOLUME_FOR_BURN = 1000000000; ;; 1 токен
+const int BURN_RATE_STEP = 10; ;; 0.1% шаг изменения
+
+;; Параметры безопасности
+const int TRANSACTION_LIMIT = 1000000000000; ;; 1000 токенов в час
+const int BLACKLIST_EXPIRE = 30 * 24 * 3600; ;; 30 дней
+const int MAX_FAILED_ATTEMPTS = 3; ;; Максимальное количество неудачных попыток
+
+;; Параметры аналитики
+const int STATS_PERIOD = 3600; ;; 1 час
+const int MAX_EVENTS_PER_HOUR = 1000;
+const int MIN_EVENT_INTERVAL = 1; ;; 1 секунда
+
+;; Математические константы
+const int PRICE_SCALE = 1000000000; ;; 9 десятичных знаков
+const int PERCENTAGE_SCALE = 10000; ;; 100.00%
+const int TIME_SCALE = 365 * 24 * 3600; ;; Секунд в году 

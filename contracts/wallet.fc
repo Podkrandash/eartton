@@ -1,0 +1,270 @@
+;; Eartton Wallet Contract
+;; Индивидуальный кошелёк для каждого пользователя
+
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/op-codes.fc";
+
+;; Структура данных
+;; storage#_ balance:Coins owner_address:MsgAddress master_address:MsgAddress
+;;           locked_balance:Coins unlock_time:uint32 = Storage;
+
+(int, slice, slice, int, int) load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_coins(),      ;; balance
+        ds~load_msg_addr(),   ;; owner_address
+        ds~load_msg_addr(),   ;; master_address
+        ds~load_coins(),      ;; locked_balance (для стейкинга)
+        ds~load_uint(32)      ;; unlock_time (время разблокировки стейка)
+    );
+}
+
+() save_data(int balance, slice owner_address, slice master_address, int locked_balance, int unlock_time) impure inline {
+    set_data(begin_cell()
+        .store_coins(balance)
+        .store_slice(owner_address)
+        .store_slice(master_address)
+        .store_coins(locked_balance)
+        .store_uint(unlock_time, 32)
+        .end_cell());
+}
+
+;; Проверка, является ли отправитель мастер-контрактом
+int is_master(slice sender, slice master_address) inline {
+    return equal_slices(sender, master_address);
+}
+
+;; Проверка, является ли отправитель владельцем
+int is_owner(slice sender, slice owner_address) inline {
+    return equal_slices(sender, owner_address);
+}
+
+;; Получение параметров Eartton из мастер-контракта
+(int, int, int, int) get_eartton_params(slice master_address) inline {
+    var (burn_rate, staking_apr, farming_pool_size, paused) = 
+        contract_call(master_address, "get_eartton_params", []);
+    return (burn_rate, staking_apr, farming_pool_size, paused);
+}
+
+;; Проверка, находится ли адрес в черном списке
+int is_blacklisted(slice addr, slice master_address) inline {
+    var (result) = contract_call(master_address, "is_address_blacklisted", [addr]);
+    return result;
+}
+
+;; Обработка входящих сообщений
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; Игнорируем пустые сообщения
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) { ;; Игнорируем сообщения от самого себя
+        return ();
+    }
+    
+    slice sender_address = cs~load_msg_addr();
+    
+    (int balance, slice owner_address, slice master_address, int locked_balance, int unlock_time) = load_data();
+    
+    ;; Проверка на черный список
+    if (is_blacklisted(owner_address, master_address)) {
+        ;; Владелец в черном списке, отклоняем операцию
+        return ();
+    }
+    
+    ;; Получаем параметры из мастер-контракта
+    (int burn_rate, int staking_apr, int farming_pool_size, int paused) = get_eartton_params(master_address);
+    
+    ;; Проверка на паузу
+    if (paused == 1) {
+        ;; Токен на паузе, отклоняем операцию
+        return ();
+    }
+    
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+    
+    ;; Обработка операций
+    if (op == op::transfer) {
+        ;; Только владелец может переводить токены
+        throw_unless(73, is_owner(sender_address, owner_address));
+        
+        int amount = in_msg_body~load_coins();
+        slice to_address = in_msg_body~load_msg_addr();
+        
+        ;; Проверка баланса
+        throw_unless(74, balance >= amount);
+        
+        ;; Расчет суммы для сжигания (если включено)
+        int burn_amount = (amount * burn_rate) / 10000; ;; burn_rate в базисных пунктах
+        int transfer_amount = amount - burn_amount;
+        
+        ;; Уменьшаем баланс
+        balance -= amount;
+        
+        ;; Сжигаем токены (если нужно)
+        if (burn_amount > 0) {
+            var burn_msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(master_address)
+                .store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::burn_notification, 32)
+                .store_uint(query_id, 64)
+                .store_coins(burn_amount)
+                .store_slice(owner_address)
+                .end_cell();
+            send_raw_message(burn_msg, 64);
+        }
+        
+        ;; Получаем адрес кошелька получателя
+        var (to_wallet_address) = contract_call(master_address, "get_wallet_address", [to_address]);
+        
+        ;; Отправляем токены
+        var transfer_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(to_wallet_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::internal_transfer, 32)
+            .store_uint(query_id, 64)
+            .store_coins(transfer_amount)
+            .store_slice(owner_address)
+            .store_slice(owner_address)
+            .store_coins(0)
+            .store_uint(0, 1)
+            .end_cell();
+        send_raw_message(transfer_msg, 64);
+        
+        save_data(balance, owner_address, master_address, locked_balance, unlock_time);
+        return ();
+    }
+    
+    if (op == op::internal_transfer) {
+        ;; Только мастер или другой кошелек может вызывать internal_transfer
+        throw_unless(73, is_master(sender_address, master_address) | 
+                        equal_slices(sender_address, contract_call(master_address, "get_wallet_address", [in_msg_body~load_msg_addr()])));
+        
+        int amount = in_msg_body~load_coins();
+        balance += amount;
+        
+        save_data(balance, owner_address, master_address, locked_balance, unlock_time);
+        return ();
+    }
+    
+    if (op == op::burn) {
+        ;; Только владелец может сжигать токены
+        throw_unless(73, is_owner(sender_address, owner_address));
+        
+        int amount = in_msg_body~load_coins();
+        
+        ;; Проверка баланса
+        throw_unless(74, balance >= amount);
+        
+        ;; Уменьшаем баланс
+        balance -= amount;
+        
+        ;; Отправляем уведомление о сжигании в мастер-контракт
+        var burn_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(master_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::burn_notification, 32)
+            .store_uint(query_id, 64)
+            .store_coins(amount)
+            .store_slice(owner_address)
+            .end_cell();
+        send_raw_message(burn_msg, 64);
+        
+        save_data(balance, owner_address, master_address, locked_balance, unlock_time);
+        return ();
+    }
+    
+    if (op == op::stake) {
+        ;; Только владелец может стейкать токены
+        throw_unless(73, is_owner(sender_address, owner_address));
+        
+        int amount = in_msg_body~load_coins();
+        int duration = in_msg_body~load_uint(32);
+        
+        ;; Проверка баланса
+        throw_unless(74, balance >= amount);
+        
+        ;; Уменьшаем баланс и увеличиваем заблокированный баланс
+        balance -= amount;
+        locked_balance += amount;
+        unlock_time = now() + duration;
+        
+        ;; Отправляем уведомление о стейкинге в мастер-контракт
+        var stake_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(master_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::stake_notification, 32)
+            .store_uint(query_id, 64)
+            .store_coins(amount)
+            .store_uint(duration, 32)
+            .store_slice(owner_address)
+            .end_cell();
+        send_raw_message(stake_msg, 64);
+        
+        save_data(balance, owner_address, master_address, locked_balance, unlock_time);
+        return ();
+    }
+    
+    if (op == op::unstake) {
+        ;; Только владелец может разблокировать стейк
+        throw_unless(73, is_owner(sender_address, owner_address));
+        
+        ;; Проверка времени разблокировки
+        throw_unless(75, now() >= unlock_time);
+        
+        ;; Расчет награды за стейкинг
+        int staking_time = now() - (unlock_time - locked_balance);
+        int reward = (locked_balance * staking_apr * staking_time) / (365 * 24 * 3600 * 10000); ;; APR в год
+        
+        ;; Возвращаем токены и награду
+        balance += locked_balance + reward;
+        
+        ;; Отправляем уведомление о разблокировке в мастер-контракт
+        var unstake_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(master_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::unstake_notification, 32)
+            .store_uint(query_id, 64)
+            .store_coins(locked_balance)
+            .store_coins(reward)
+            .store_slice(owner_address)
+            .end_cell();
+        send_raw_message(unstake_msg, 64);
+        
+        ;; Сбрасываем заблокированный баланс и время разблокировки
+        locked_balance = 0;
+        unlock_time = 0;
+        
+        save_data(balance, owner_address, master_address, locked_balance, unlock_time);
+        return ();
+    }
+    
+    throw(0xffff); ;; Неизвестная операция
+}
+
+;; Получение баланса
+(int, slice, slice, int) get_wallet_data() method_id {
+    (int balance, slice owner_address, slice master_address, int locked_balance, int unlock_time) = load_data();
+    return (balance, owner_address, master_address, locked_balance);
+}
+
+;; Получение информации о стейкинге
+(int, int) get_staking_data() method_id {
+    (int balance, slice owner_address, slice master_address, int locked_balance, int unlock_time) = load_data();
+    return (locked_balance, unlock_time);
+} 

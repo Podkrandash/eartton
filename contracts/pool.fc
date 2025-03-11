@@ -1,0 +1,211 @@
+;; Eartton Pool Contract
+;; Отдельный контракт для управления пулами стейкинга и фарминга
+
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/op-codes.fc";
+
+;; Структура данных пула ликвидности
+;; storage#_ token_reserves:Coins other_token_reserves:Coins 
+;;           lp_supply:Coins master_address:MsgAddress
+;;           other_token_address:MsgAddress fee_rate:uint16 = Storage;
+
+(int, int, int, slice, slice, int) load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_coins(),      ;; token_reserves
+        ds~load_coins(),      ;; other_token_reserves
+        ds~load_coins(),      ;; lp_supply
+        ds~load_msg_addr(),   ;; master_address
+        ds~load_msg_addr(),   ;; other_token_address
+        ds~load_uint(16)      ;; fee_rate (в базисных пунктах)
+    );
+}
+
+() save_data(int token_reserves, int other_token_reserves, int lp_supply,
+            slice master_address, slice other_token_address, int fee_rate) impure inline {
+    set_data(begin_cell()
+        .store_coins(token_reserves)
+        .store_coins(other_token_reserves)
+        .store_coins(lp_supply)
+        .store_slice(master_address)
+        .store_slice(other_token_address)
+        .store_uint(fee_rate, 16)
+        .end_cell());
+}
+
+;; Функции AMM
+int calculate_output_amount(int input_amount, int input_reserve, int output_reserve) inline {
+    int input_with_fee = input_amount * (10000 - fee_rate);
+    return (input_with_fee * output_reserve) / ((input_reserve * 10000) + input_with_fee);
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) {
+        return ();
+    }
+    
+    slice sender_address = cs~load_msg_addr();
+    
+    (int token_reserves, int other_token_reserves, int lp_supply,
+     slice master_address, slice other_token_address, int fee_rate) = load_data();
+    
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+    
+    if (op == op::swap) {
+        int amount_in = in_msg_body~load_coins();
+        int is_token_to_other = in_msg_body~load_uint(1);
+        
+        int amount_out = 0;
+        if (is_token_to_other) {
+            amount_out = calculate_output_amount(amount_in, token_reserves, other_token_reserves);
+            token_reserves += amount_in;
+            other_token_reserves -= amount_out;
+            
+            ;; Отправляем другие токены
+            cell msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(sender_address)
+                .store_coins(0)
+                .store_uint(op::transfer, 32)
+                .store_uint(query_id, 64)
+                .store_slice(other_token_address)
+                .store_coins(amount_out)
+                .end_cell();
+            
+            send_raw_message(msg, 64);
+        } else {
+            amount_out = calculate_output_amount(amount_in, other_token_reserves, token_reserves);
+            other_token_reserves += amount_in;
+            token_reserves -= amount_out;
+            
+            ;; Отправляем токены Eartton
+            cell msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(sender_address)
+                .store_coins(0)
+                .store_uint(op::transfer, 32)
+                .store_uint(query_id, 64)
+                .store_coins(amount_out)
+                .end_cell();
+            
+            send_raw_message(msg, 64);
+        }
+        
+        save_data(token_reserves, other_token_reserves, lp_supply,
+                 master_address, other_token_address, fee_rate);
+        return ();
+    }
+    
+    if (op == op::add_liquidity) {
+        int token_amount = in_msg_body~load_coins();
+        int other_token_amount = in_msg_body~load_coins();
+        
+        ;; Рассчитываем количество LP токенов для выпуска
+        int lp_tokens_to_mint = 0;
+        if (lp_supply == 0) {
+            lp_tokens_to_mint = math::sqrt(token_amount * other_token_amount);
+        } else {
+            int token_ratio = (token_amount * 1000000000) / token_reserves;
+            int other_ratio = (other_token_amount * 1000000000) / other_token_reserves;
+            int min_ratio = min(token_ratio, other_ratio);
+            lp_tokens_to_mint = (lp_supply * min_ratio) / 1000000000;
+        }
+        
+        ;; Обновляем резервы
+        token_reserves += token_amount;
+        other_token_reserves += other_token_amount;
+        lp_supply += lp_tokens_to_mint;
+        
+        ;; Отправляем LP токены
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(op::mint_lp, 32)
+            .store_uint(query_id, 64)
+            .store_coins(lp_tokens_to_mint)
+            .end_cell();
+        
+        send_raw_message(msg, 64);
+        
+        save_data(token_reserves, other_token_reserves, lp_supply,
+                 master_address, other_token_address, fee_rate);
+        return ();
+    }
+    
+    if (op == op::remove_liquidity) {
+        int lp_amount = in_msg_body~load_coins();
+        
+        ;; Рассчитываем количество токенов для возврата
+        int token_amount = (token_reserves * lp_amount) / lp_supply;
+        int other_token_amount = (other_token_reserves * lp_amount) / lp_supply;
+        
+        ;; Обновляем резервы
+        token_reserves -= token_amount;
+        other_token_reserves -= other_token_amount;
+        lp_supply -= lp_amount;
+        
+        ;; Отправляем токены обратно
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(op::transfer, 32)
+            .store_uint(query_id, 64)
+            .store_coins(token_amount)
+            .end_cell();
+        
+        send_raw_message(msg, 64);
+        
+        msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(op::transfer, 32)
+            .store_uint(query_id, 64)
+            .store_slice(other_token_address)
+            .store_coins(other_token_amount)
+            .end_cell();
+        
+        send_raw_message(msg, 64);
+        
+        save_data(token_reserves, other_token_reserves, lp_supply,
+                 master_address, other_token_address, fee_rate);
+        return ();
+    }
+    
+    if (op == op::update_fee_rate) {
+        ;; Только мастер-контракт может обновлять комиссию
+        throw_unless(73, equal_slices(sender_address, master_address));
+        
+        int new_fee_rate = in_msg_body~load_uint(16);
+        fee_rate = new_fee_rate;
+        
+        save_data(token_reserves, other_token_reserves, lp_supply,
+                 master_address, other_token_address, fee_rate);
+        return ();
+    }
+    
+    throw(0xffff);
+}
+
+;; Геттеры
+(int, int, int) get_pool_data() method_id {
+    (int token_reserves, int other_token_reserves, int lp_supply,
+     slice master_address, slice other_token_address, int fee_rate) = load_data();
+    return (token_reserves, other_token_reserves, lp_supply);
+}
+
+int get_exchange_rate() method_id {
+    (int token_reserves, int other_token_reserves, _, _, _, _) = load_data();
+    return (other_token_reserves * 1000000000) / token_reserves;
+} 

@@ -1,0 +1,461 @@
+;; Eartton Master Contract
+;; Управляет созданием токенов, глобальными параметрами и общей логикой
+
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/op-codes.fc";
+
+;; Структура данных
+;; storage#_ total_supply:Coins owner_address:MsgAddress content:^Cell jetton_wallet_code:^Cell
+;;           burn_rate:uint16 staking_apr:uint16 farming_pool_size:Coins paused:Bool blacklist:^Cell
+;;           governance:^Cell last_distribution_time:uint64 dynamic_params:^Cell = Storage;
+
+(int, slice, cell, cell, int, int, int, int, cell, cell, int, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_coins(),      ;; total_supply
+        ds~load_msg_addr(),   ;; owner_address
+        ds~load_ref(),        ;; content
+        ds~load_ref(),        ;; jetton_wallet_code
+        ds~load_uint(16),     ;; burn_rate (упаковано в 16 бит)
+        ds~load_uint(16),     ;; staking_apr (упаковано в 16 бит)
+        ds~load_coins(),      ;; farming_pool_size
+        ds~load_uint(1),      ;; paused (всего 1 бит)
+        ds~load_ref(),        ;; blacklist (оптимизированный словарь)
+        ds~load_ref(),        ;; governance (система управления)
+        ds~load_uint(64),     ;; last_distribution_time
+        ds~load_ref()         ;; dynamic_params (параметры для динамических механизмов)
+    );
+}
+
+() save_data(int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+            int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+            cell governance, int last_distribution_time, cell dynamic_params) impure inline {
+    set_data(begin_cell()
+        .store_coins(total_supply)
+        .store_slice(owner_address)
+        .store_ref(content)
+        .store_ref(jetton_wallet_code)
+        .store_uint(burn_rate, 16)
+        .store_uint(staking_apr, 16)
+        .store_coins(farming_pool_size)
+        .store_uint(paused, 1)
+        .store_ref(blacklist)
+        .store_ref(governance)
+        .store_uint(last_distribution_time, 64)
+        .store_ref(dynamic_params)
+        .end_cell());
+}
+
+;; Получение адреса кошелька Eartton для владельца
+slice calculate_user_wallet_address(slice owner_address, cell jetton_wallet_code) inline {
+    cell state_init = begin_cell()
+        .store_uint(0, 2)
+        .store_dict(jetton_wallet_code)
+        .store_dict(begin_cell().store_slice(owner_address).store_ref(begin_cell().store_slice(my_address()).end_cell()).end_cell())
+        .store_uint(0, 1)
+        .end_cell();
+    
+    return begin_cell()
+        .store_uint(4, 3)
+        .store_int(workchain(), 8)
+        .store_uint(cell_hash(state_init), 256)
+        .end_cell()
+        .begin_parse();
+}
+
+;; Проверка, находится ли адрес в черном списке
+int is_blacklisted(slice addr, cell blacklist) inline {
+    (cell dict, int found) = blacklist.udict_get?(256, slice_hash(addr));
+    return found;
+}
+
+;; Обработка входящих сообщений
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; Игнорируем пустые сообщения
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) { ;; Игнорируем сообщения от самого себя
+        return ();
+    }
+    
+    slice sender_address = cs~load_msg_addr();
+    
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+    
+    int op = in_msg_body~load_uint(32);
+    
+    ;; Проверка на черный список
+    if (is_blacklisted(sender_address, blacklist)) {
+        ;; Отправитель в черном списке, отклоняем операцию
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::blacklisted, 32)
+            .store_uint(0, 64) ;; query id
+            .end_cell();
+        send_raw_message(msg, 64);
+        return ();
+    }
+    
+    ;; Проверка на паузу (кроме операции unpause)
+    if ((paused == 1) & (op != op::unpause)) {
+        ;; Токен на паузе, отклоняем операцию
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::paused, 32)
+            .store_uint(0, 64) ;; query id
+            .end_cell();
+        send_raw_message(msg, 64);
+        return ();
+    }
+    
+    int query_id = in_msg_body~load_uint(64);
+    
+    ;; Обработка операций
+    if (op == op::mint) {
+        ;; Только владелец может минтить токены
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        slice to_address = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        cell master_msg = in_msg_body~load_ref();
+        
+        slice to_wallet_address = calculate_user_wallet_address(to_address, jetton_wallet_code);
+        
+        ;; Создаем сообщение для кошелька
+        var msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(to_wallet_address)
+            .store_coins(amount)
+            .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+            .store_ref(jetton_wallet_code)
+            .store_ref(begin_cell().store_slice(to_address).store_ref(begin_cell().store_slice(my_address()).end_cell()).end_cell())
+            .store_uint(0, 1)
+            .store_uint(op::internal_transfer, 32)
+            .store_uint(query_id, 64)
+            .store_coins(amount)
+            .store_slice(my_address())
+            .store_slice(my_address())
+            .store_coins(0)
+            .store_uint(0, 1)
+            .store_ref(master_msg);
+        
+        send_raw_message(msg.end_cell(), 1); ;; оплата из баланса сообщения
+        
+        total_supply += amount;
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, paused, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::burn_notification) {
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(74, equal_slices(calculate_user_wallet_address(from_address, jetton_wallet_code), sender_address));
+        
+        total_supply -= amount;
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, paused, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::pause) {
+        ;; Только владелец может ставить на паузу
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, 1, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::unpause) {
+        ;; Только владелец может снимать с паузы
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, 0, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::add_to_blacklist) {
+        ;; Только владелец может добавлять в черный список
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        slice addr = in_msg_body~load_msg_addr();
+        cell new_blacklist = blacklist;
+        new_blacklist~udict_set(256, slice_hash(addr), begin_cell().store_uint(1, 1).end_cell());
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, paused, new_blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::remove_from_blacklist) {
+        ;; Только владелец может удалять из черного списка
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        slice addr = in_msg_body~load_msg_addr();
+        cell new_blacklist = blacklist;
+        new_blacklist~udict_delete?(256, slice_hash(addr));
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, staking_apr, farming_pool_size, paused, new_blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::update_staking_apr) {
+        ;; Только владелец может обновлять APR стейкинга
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        int new_apr = in_msg_body~load_uint(16);
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, burn_rate, new_apr, farming_pool_size, paused, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::update_burn_rate) {
+        ;; Только владелец может обновлять ставку сжигания
+        throw_unless(73, equal_slices(sender_address, owner_address));
+        
+        int new_burn_rate = in_msg_body~load_uint(16);
+        
+        save_data(total_supply, owner_address, content, jetton_wallet_code, new_burn_rate, staking_apr, farming_pool_size, paused, blacklist, governance, last_distribution_time, dynamic_params);
+        return ();
+    }
+    
+    if (op == op::stake_notification) {
+        ;; Обработка уведомления о стейкинге
+        int amount = in_msg_body~load_coins();
+        int duration = in_msg_body~load_uint(32);
+        slice staker_address = in_msg_body~load_msg_addr();
+        
+        ;; Здесь можно добавить логику для обработки стейкинга
+        ;; Например, обновление общего пула стейкинга
+        
+        return ();
+    }
+    
+    if (op == op::unstake_notification) {
+        ;; Обработка уведомления о разблокировке стейка
+        int amount = in_msg_body~load_coins();
+        int reward = in_msg_body~load_coins();
+        slice staker_address = in_msg_body~load_msg_addr();
+        
+        ;; Здесь можно добавить логику для обработки разблокировки
+        
+        return ();
+    }
+    
+    if (op == op::propose_vote) {
+        int proposal_id = in_msg_body~load_uint(32);
+        int vote = in_msg_body~load_uint(1);
+        process_proposal(proposal_id, sender_address, vote);
+        return ();
+    }
+
+    if (op == op::stake) {
+        int amount = in_msg_body~load_coins();
+        int lock_period = in_msg_body~load_uint(32);
+        process_stake(sender_address, amount, lock_period);
+        return ();
+    }
+
+    if (op == op::swap) {
+        int amount_in = in_msg_body~load_coins();
+        slice token_out_address = in_msg_body~load_msg_addr();
+        process_swap(sender_address, amount_in, token_out_address);
+        return ();
+    }
+    
+    ;; Обновление динамических параметров каждые 24 часа
+    if ((now() - last_distribution_time) >= 24 * 3600) {
+        update_dynamic_parameters();
+    }
+    
+    throw(0xffff); ;; Неизвестная операция
+}
+
+;; Получение данных о токене
+(int, int, slice, cell, cell) get_jetton_data() method_id {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+    
+    return (total_supply, -1, owner_address, content, jetton_wallet_code);
+}
+
+;; Получение адреса кошелька для владельца
+slice get_wallet_address(slice owner_address) method_id {
+    (int total_supply, slice owner_address_data, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+    
+    return calculate_user_wallet_address(owner_address, jetton_wallet_code);
+}
+
+;; Получение параметров Eartton
+(int, int, int, int) get_eartton_params() method_id {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+    
+    return (burn_rate, staking_apr, farming_pool_size, paused);
+}
+
+;; Проверка, находится ли адрес в черном списке
+int is_address_blacklisted(slice addr) method_id {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+    
+    return is_blacklisted(addr, blacklist);
+}
+
+;; Функции для управления динамическими параметрами
+() update_dynamic_parameters() impure inline {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+
+    ;; Получаем текущие параметры
+    slice ds = dynamic_params.begin_parse();
+    int current_volume = ds~load_coins();
+    int last_update = ds~load_uint(64);
+    int market_price = ds~load_coins();
+
+    ;; Обновляем ставку сжигания на основе объема транзакций
+    int new_burn_rate = min(max(burn_rate * current_volume / (total_supply / 100), 10), 1000);
+    
+    ;; Обновляем APR стейкинга на основе рыночных условий
+    int new_staking_apr = min(max(staking_apr * market_price / (total_supply / 100), 500), 5000);
+
+    ;; Сохраняем новые параметры
+    cell new_dynamic_params = begin_cell()
+        .store_coins(0) ;; Сбрасываем объем
+        .store_uint(now(), 64)
+        .store_coins(market_price)
+        .end_cell();
+
+    save_data(total_supply, owner_address, content, jetton_wallet_code, 
+             new_burn_rate, new_staking_apr, farming_pool_size, paused, blacklist,
+             governance, last_distribution_time, new_dynamic_params);
+}
+
+;; Функции для управления стейкингом
+() process_stake(slice sender_address, int amount, int lock_period) impure inline {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+
+    ;; Рассчитываем бонусный APR на основе периода блокировки
+    int bonus_apr = min(staking_apr * lock_period / (30 * 24 * 3600), staking_apr * 2);
+
+    ;; Создаем stToken
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(sender_address)
+        .store_coins(0)
+        .store_uint(op::mint_sttoken, 32)
+        .store_uint(0, 64) ;; query_id
+        .store_coins(amount)
+        .store_uint(bonus_apr, 16)
+        .store_uint(now() + lock_period, 64)
+        .end_cell();
+
+    send_raw_message(msg, 64);
+}
+
+;; Функции для голосования
+() process_proposal(int proposal_id, slice sender_address, int vote) impure inline {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+
+    ;; Получаем информацию о предложении
+    (cell proposal_data, int found) = governance.udict_get?(32, proposal_id);
+    throw_unless(75, found);
+
+    slice ps = proposal_data.begin_parse();
+    int param_id = ps~load_uint(8);
+    int new_value = ps~load_uint(256);
+    int end_time = ps~load_uint(32);
+    int votes_for = ps~load_uint(16);
+    int votes_against = ps~load_uint(16);
+    cell voters = ps~load_dict();
+
+    ;; Проверяем, не голосовал ли уже
+    (_, int already_voted) = voters.udict_get?(256, slice_hash(sender_address));
+    throw_if(76, already_voted);
+
+    ;; Обновляем голоса
+    if (vote) {
+        votes_for += 1;
+    } else {
+        votes_against += 1;
+    }
+
+    ;; Сохраняем информацию о голосовании
+    voters~udict_set(256, slice_hash(sender_address), begin_cell().store_uint(1, 1).end_cell());
+
+    ;; Проверяем, достигнут ли кворум
+    if ((votes_for + votes_against >= 100) & (votes_for > votes_against * 2)) {
+        ;; Применяем изменения
+        if (param_id == 1) { ;; Изменение ставки сжигания
+            burn_rate = new_value;
+        } elseif (param_id == 2) { ;; Изменение APR стейкинга
+            staking_apr = new_value;
+        }
+        ;; ... другие параметры
+
+        ;; Удаляем предложение
+        governance~udict_delete?(32, proposal_id);
+    } else {
+        ;; Обновляем данные предложения
+        cell new_proposal = begin_cell()
+            .store_uint(param_id, 8)
+            .store_uint(new_value, 256)
+            .store_uint(end_time, 32)
+            .store_uint(votes_for, 16)
+            .store_uint(votes_against, 16)
+            .store_dict(voters)
+            .end_cell();
+        governance~udict_set(32, proposal_id, new_proposal);
+    }
+
+    save_data(total_supply, owner_address, content, jetton_wallet_code, 
+             burn_rate, staking_apr, farming_pool_size, paused, blacklist,
+             governance, last_distribution_time, dynamic_params);
+}
+
+;; Функции для DeFi операций
+() process_swap(slice sender_address, int amount_in, slice token_out_address) impure inline {
+    (int total_supply, slice owner_address, cell content, cell jetton_wallet_code, 
+     int burn_rate, int staking_apr, int farming_pool_size, int paused, cell blacklist,
+     cell governance, int last_distribution_time, cell dynamic_params) = load_data();
+
+    ;; Получаем текущий курс обмена
+    slice ds = dynamic_params.begin_parse();
+    int market_price = ds~load_coins();
+
+    ;; Рассчитываем количество токенов на выход
+    int amount_out = (amount_in * market_price) / 1000000000; ;; Нормализация на 9 десятичных знаков
+
+    ;; Отправляем токены
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(token_out_address)
+        .store_coins(0)
+        .store_uint(op::transfer, 32)
+        .store_uint(0, 64) ;; query_id
+        .store_slice(sender_address)
+        .store_coins(amount_out)
+        .end_cell();
+
+    send_raw_message(msg, 64);
+} 

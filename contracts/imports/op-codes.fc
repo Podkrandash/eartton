@@ -1,0 +1,66 @@
+;; Operation codes for Eartton
+;; Коды операций для стандарта Eartton
+
+;; Базовые операции
+const int op::transfer = 0xf8a7ea5;
+const int op::transfer_notification = 0x7362d09c;
+const int op::internal_transfer = 0x178d4519;
+const int op::excesses = 0xd53276db;
+const int op::burn = 0x595f07bc;
+const int op::burn_notification = 0x7bdd97de;
+
+;; Административные операции
+const int op::mint = 0x1674b0a0;
+const int op::pause = 0x0BBAB481;
+const int op::unpause = 0x1B31A32B;
+const int op::blacklisted = 0x2A4E7C41;
+const int op::paused = 0x1B31A32C;
+
+;; Операции управления
+const int op::propose_vote = 0x1234F001;
+const int op::cast_vote = 0x1234F002;
+const int op::execute_proposal = 0x1234F003;
+const int op::cancel_proposal = 0x1234F004;
+
+;; Операции стейкинга
+const int op::stake = 0x1234F101;
+const int op::unstake = 0x1234F102;
+const int op::claim_rewards = 0x1234F103;
+const int op::distribute_rewards = 0x1234F104;
+const int op::update_staking_params = 0x1234F105;
+
+;; Операции ликвидного стейкинга
+const int op::mint_sttoken = 0x1234F201;
+const int op::burn_sttoken = 0x1234F202;
+const int op::update_exchange_rate = 0x1234F203;
+
+;; Операции DeFi
+const int op::swap = 0x1234F301;
+const int op::add_liquidity = 0x1234F302;
+const int op::remove_liquidity = 0x1234F303;
+const int op::update_amm_params = 0x1234F304;
+
+;; Операции динамических механизмов
+const int op::update_dynamic_burn_rate = 0x1234F401;
+const int op::update_dynamic_apr = 0x1234F402;
+const int op::rebalance_pool = 0x1234F403;
+
+;; Операции аналитики
+const int op::log_event = 0x1234F501;
+const int op::update_stats = 0x1234F502;
+
+;; Расширенные операции Eartton
+const int op::stake_notification = 0x11223344;
+const int op::unstake_notification = 0x44332211;
+const int op::deposit = 0xabcdef01;
+const int op::withdraw = 0x10fedcba;
+const int op::claim = 0x98765432;
+const int op::add_to_blacklist = 0xaabbccdd;
+const int op::remove_from_blacklist = 0xddccbbaa;
+const int op::update_staking_apr = 0x11112222;
+const int op::update_burn_rate = 0x22221111;
+const int op::update_reward_rate = 0x33334444;
+
+;; Коды ошибок
+const int op::blacklisted = 0xeeee0001;
+const int op::paused = 0xeeee0002; 
